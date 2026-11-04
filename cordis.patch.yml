@@ -1,0 +1,7 @@
+- insert:
+    - id: dsh-openai-api
+      name: '@local/dsh-openai-api'
+      config:
+        host: 127.0.0.1
+        port: 8787
+        apiKey: ''

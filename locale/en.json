@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenAI-Compatible API",
+    "description": "Serves every model available in Harness through a local OpenAI-compatible HTTP API (/v1/models, /v1/chat/completions)."
+  }
+}

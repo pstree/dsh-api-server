@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OpenAI 兼容 API",
+    "description": "把 Harness 中可用的模型通过本机 OpenAI 兼容 HTTP 接口开放（/v1/models、/v1/chat/completions）。"
+  }
+}
