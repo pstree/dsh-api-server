@@ -55,10 +55,14 @@ plugin_manager action=install_bundle target="C:\Users\qian\Desktop\dsh-api-serve
 
 模型寻址规则：
 
-1. `provider/model`（如 `deepseek-account/deepseek-flash`）总是直接路由；
-2. 裸模型名（如 `deepseek-flash`）在目录中唯一匹配时使用；
-3. 裸模型名在目录中不存在时返回 404（避免拼写错误静默发到上游）；
-4. 目录因鉴权等原因完全取不到时，回退到唯一 provider 或 `defaultModel`。
+1. `/v1/models` 里列出的 `id` 原样发回，一定路由到发布它的那个 provider（provider 自身的 id 带 `/` 也不会错）；
+2. 手写 `provider/model` 时，provider 已注册即可路由，模型不必出现在目录中（兼容不做 discovery 的 adapter）；
+3. provider 未注册时返回 404 `provider_not_found`，不再把拼错的 provider 静默转发到上游；
+4. 裸模型名（如 `deepseek-flash`）仅在目录中唯一匹配时使用；多个 provider 同名时返回 400 `model_ambiguous` 并列出全部候选；
+5. 裸模型名在目录中不存在时返回 404（避免拼写错误静默发到上游）；
+6. 目录因鉴权等原因完全取不到时，回退到唯一 provider 或 `defaultModel`。
+
+`GET /v1/models/{id}` 与对话接口使用同一套匹配规则：裸名有歧义同样返回 400，非法百分号编码返回 400 `invalid_model_id`。
 
 ## 调用示例
 

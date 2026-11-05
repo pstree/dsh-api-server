@@ -64,6 +64,47 @@ function createFakeLlm() {
   }
 }
 
+/**
+ * Three providers, one of them with a slash in its id, and two that advertise
+ * the same bare model id. Every `stream` call is recorded so a test can assert
+ * which upstream the gateway actually picked.
+ */
+function createMultiProviderLlm() {
+  const calls = []
+  return {
+    calls,
+    listProviders: () => [
+      { id: 'alpha', name: 'Alpha' },
+      { id: 'beta', name: 'Beta' },
+      { id: 'openai/azure', name: 'Azure' },
+    ],
+    listModels: async (provider) => {
+      if (provider === 'alpha') {
+        return [
+          { provider, id: 'shared', name: 'Shared (Alpha)' },
+          { provider, id: 'deepseek-ai/DeepSeek-V3', name: 'DeepSeek V3' },
+        ]
+      }
+      if (provider === 'beta') return [{ provider, id: 'shared', name: 'Shared (Beta)' }]
+      if (provider === 'openai/azure') return [{ provider, id: 'gpt-4o', name: 'GPT-4o' }]
+      return []
+    },
+    resolveModelInfo: async (provider, model) => ({ provider, id: model, name: model }),
+    stream(options) {
+      calls.push({ provider: options.provider, model: options.model })
+      return textStream()
+    },
+  }
+}
+
+function postChat(base, body) {
+  return fetch(`${base}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
 const results = []
 function check(name, fn) {
   results.push({ name, fn })
@@ -286,6 +327,123 @@ async function main() {
         assert.deepEqual(after.data.map((entry) => entry.id), ['late/late-chat'])
       } finally {
         await lateServer.stop()
+      }
+    })
+
+    check('provider prefixes disambiguate identical bare model ids', async () => {
+      const llm = createMultiProviderLlm()
+      const multi = createOpenAiServer({ llm, config: { port: 0 } })
+      await multi.start()
+      try {
+        const origin = multi.address()
+        const listed = (await (await fetch(`${origin}/v1/models`)).json()).data.map((entry) => entry.id)
+        assert.ok(listed.includes('alpha/shared'))
+        assert.ok(listed.includes('beta/shared'))
+        assert.ok(listed.includes('openai/azure/gpt-4o'))
+
+        // A bare id served twice must fail loudly instead of picking a provider.
+        const ambiguous = await postChat(origin, {
+          model: 'shared',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(ambiguous.status, 400)
+        assert.equal((await ambiguous.json()).error.code, 'model_ambiguous')
+        assert.equal(llm.calls.length, 0)
+
+        // A listing id copied verbatim routes to the provider that listed it,
+        // including when that provider's own id contains slashes.
+        const azure = await postChat(origin, {
+          model: 'openai/azure/gpt-4o',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(azure.status, 200)
+        assert.deepEqual(llm.calls.at(-1), { provider: 'openai/azure', model: 'gpt-4o' })
+
+        const alpha = await postChat(origin, {
+          model: 'alpha/shared',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(alpha.status, 200)
+        assert.deepEqual(llm.calls.at(-1), { provider: 'alpha', model: 'shared' })
+
+        // A misspelt provider is a 404, not an upstream call.
+        llm.calls.length = 0
+        const ghost = await postChat(origin, {
+          model: 'ghost/shared',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(ghost.status, 404)
+        assert.equal((await ghost.json()).error.code, 'provider_not_found')
+        assert.equal(llm.calls.length, 0)
+
+        // A registered provider may still be addressed with an unlisted model,
+        // which keeps hand-written routes working without discovery.
+        const unlisted = await postChat(origin, {
+          model: 'alpha/not-advertised',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(unlisted.status, 200)
+        assert.deepEqual(llm.calls.at(-1), { provider: 'alpha', model: 'not-advertised' })
+      } finally {
+        await multi.stop()
+      }
+    })
+
+    check('GET /v1/models/{id} agrees with the chat endpoint', async () => {
+      const llm = createMultiProviderLlm()
+      const multi = createOpenAiServer({ llm, config: { port: 0 } })
+      await multi.start()
+      try {
+        const origin = multi.address()
+
+        // An ambiguous bare id is rejected here too.
+        const ambiguous = await fetch(`${origin}/v1/models/shared`)
+        assert.equal(ambiguous.status, 400)
+        assert.equal((await ambiguous.json()).error.code, 'model_ambiguous')
+
+        // Percent-encoded ids with slashes resolve.
+        const encoded = await fetch(`${origin}/v1/models/${encodeURIComponent('openai/azure/gpt-4o')}`)
+        assert.equal(encoded.status, 200)
+        assert.equal((await encoded.json()).id, 'openai/azure/gpt-4o')
+
+        // An unencoded slash-containing id works as well.
+        const plain = await fetch(`${origin}/v1/models/alpha/deepseek-ai/DeepSeek-V3`)
+        assert.equal(plain.status, 200)
+        assert.equal((await plain.json()).id, 'alpha/deepseek-ai/DeepSeek-V3')
+
+        // Malformed escape sequences are a 400, not a 500.
+        const malformed = await fetch(`${origin}/v1/models/%ZZ`)
+        assert.equal(malformed.status, 400)
+        assert.equal((await malformed.json()).error.code, 'invalid_model_id')
+      } finally {
+        await multi.stop()
+      }
+    })
+
+    check('a transient provider listing failure keeps the last catalog', async () => {
+      const llm = createFakeLlm()
+      const flaky = createOpenAiServer({ llm, config: { port: 0 } })
+      await flaky.start()
+      try {
+        const origin = flaky.address()
+        const before = await (await fetch(`${origin}/v1/models`)).json()
+        assert.equal(before.data.length, 2)
+
+        llm.listProviders = () => {
+          throw new Error('registry offline')
+        }
+        flaky.invalidateCatalog()
+
+        const after = await (await fetch(`${origin}/v1/models`)).json()
+        assert.deepEqual(after.data.map((entry) => entry.id), ['fake/fake-chat', 'fake/fake-tool'])
+
+        const routed = await postChat(origin, {
+          model: 'fake-chat',
+          messages: [{ role: 'user', content: 'hi' }],
+        })
+        assert.equal(routed.status, 200)
+      } finally {
+        await flaky.stop()
       }
     })
 
